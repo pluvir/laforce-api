@@ -23,7 +23,7 @@ app.use(cors({
   },
   credentials: false,
 }));
-app.use(express.json({ limit: '12mb' })); // 12mb handles screenshot-extract payloads
+app.use(express.json({ limit: '40mb' })); // base64-encoded screenshots can be ~1.37x file size, so 40MB headroom for the 20MB total cap enforced in routes/ai.js
 
 // ------------------------------------------------------------------
 // Per-IP rate limits — the single most important protection here
