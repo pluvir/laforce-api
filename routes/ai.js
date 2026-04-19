@@ -231,42 +231,85 @@ aiRouter.post('/extract-holdings', async (req, res, next) => {
     }
 
     const extractPrompt = [
-      `You are analyzing ${images.length} brokerage screenshot(s). Extract ALL stock/ETF holdings, but return ONE row per ticker — never duplicate.`,
+      `You are extracting brokerage positions from ${images.length} screenshot(s). Your job is to find EVERY single position and output them in CSV format. You must not miss any.`,
       '',
-      'CRITICAL DEDUP RULES — read these first:',
-      '- These screenshots are almost always ONE account shown in different views (positions list + overview chart + movers). Treat same ticker across images as the SAME position, not separate holdings.',
-      '- If ticker X appears in 3 images, return ONE row using the most authoritative source (the full positions list, not a "top movers" carousel).',
-      '- Skip screenshots that show only a total balance + line chart with no individual positions — they contain no holdings.',
-      '- If you genuinely see TWO different accounts (e.g. Investing + Roth IRA tabs both visible with different holdings), still return ONE row per ticker and SUM shares only across those distinct accounts.',
+      '═══════════════════════════════════════════════════════',
+      'STEP 1 — COUNT EVERY TICKER YOU CAN SEE',
+      '═══════════════════════════════════════════════════════',
+      'Before writing anything else, scan every image and count the number of distinct tickers (stock symbols) you can see. Include ticker rows even if their values are N/A or $0.',
+      'Start your response with exactly this line:',
+      'COUNT:N',
+      'where N is the number you counted. This number TELLS YOU how many data rows you must output in Step 3. If you output fewer, you have failed.',
       '',
-      'BROKER FORMAT NOTES:',
-      '- ROBINHOOD MOBILE: shows SYMBOL, "X.XXXXX shares", and a green-box price. THE GREEN-BOX NUMBER IS THE CURRENT SHARE PRICE, not market value. Calculate MARKET_VALUE = shares × price. Cost basis is usually not shown on this screen; put 0 if unknown.',
-      '- SCHWAB/FIDELITY DESKTOP: shows separate columns for Quantity, Price, Market Value, Cost Basis. Use the MARKET VALUE column (not Price) and the COST BASIS column directly.',
-      '- For COST_PER_SHARE: if only total cost basis is visible, divide by shares. If nothing visible, put 0.',
+      '═══════════════════════════════════════════════════════',
+      'STEP 2 — IDENTIFY THE BROKER LAYOUT',
+      '═══════════════════════════════════════════════════════',
       '',
-      'Rules:',
-      '- Include fractional shares (e.g. 26.3771 shares, 0.236650 shares)',
-      '- Skip bankrupt/delisted positions with N/A price or $0.00 market value',
-      '- Skip positions with $0.0001 or near-zero price',
-      '- If you see "Recurring Investments" (e.g. SCHD $15/week, VOO $40/week), note them separately at the END after a line that says RECURRING:',
+      'SCHWAB DESKTOP (most common):',
+      'Columns you will see, left to right: Symbol/Name | Quantity | Price | Price Change | Market Value | Day Change | Cost Basis | Gain/Loss',
+      'Example row in the image: "CMG  36  $35.83  +$0.75  $1,289.88  +$27.00  $2,044.08  -$754.20"',
+      'For this row you MUST output:   CMG,36,56.78,1289.88',
+      '  where SHARES=36 (Quantity column),  COST_PER_SHARE=56.78 (Cost Basis $2044.08 ÷ 36 shares),  MARKET_VALUE=1289.88 (Market Value column).',
       '',
-      'Return ONLY this format (no headers, no explanations):',
-      'SYMBOL,SHARES,COST_PER_SHARE,MARKET_VALUE',
+      'FIDELITY / VANGUARD DESKTOP — same structure as Schwab.',
       '',
-      'Then if recurring investments found:',
+      'ROBINHOOD MOBILE:',
+      'Each row shows: SYMBOL, "X.XXXXX shares", and a green-box number that is the CURRENT SHARE PRICE (NOT market value, NOT cost).',
+      'Example row: "NVDA  1.11 shares  $200.98"',
+      'For this row you MUST output:   NVDA,1.11,0,223.09',
+      '  where SHARES=1.11,  COST_PER_SHARE=0 (unknown on mobile),  MARKET_VALUE=223.09 (shares × price = 1.11 × 200.98).',
+      '',
+      '═══════════════════════════════════════════════════════',
+      'STEP 3 — OUTPUT ONE CSV ROW PER TICKER',
+      '═══════════════════════════════════════════════════════',
+      '',
+      'Format:  SYMBOL,SHARES,COST_PER_SHARE,MARKET_VALUE',
+      'No headers. No explanations. No markdown. One ticker per line.',
+      'The count of data rows you output MUST equal the COUNT:N from Step 1.',
+      '',
+      'SKIP a position ONLY if:',
+      '  - Price shows "N/A" AND market value shows "N/A" AND cost basis shows "N/A" (truly delisted)',
+      '  - Share count is 0 or blank',
+      '',
+      'DO NOT SKIP a position just because:',
+      '  - Cost basis column is empty (use 0)',
+      '  - You are not sure which column is which (use your best guess — DO NOT omit)',
+      '  - The ticker is unfamiliar',
+      '',
+      'DEDUP: if the same ticker appears in multiple screenshots, output it ONCE (the same account shown in different views is NOT multiple positions).',
+      '',
+      '═══════════════════════════════════════════════════════',
+      'STEP 4 — RECURRING INVESTMENTS (if present)',
+      '══════════════════════════════════════════════════════',
+      '',
+      'If any screenshot shows "Recurring Investments" (e.g. "SCHD weekly buy $15"), add AFTER the main CSV block:',
       'RECURRING:',
       'SYMBOL,MONTHLY_AMOUNT',
       '',
-      'Example (Schwab):',
+      '═══════════════════════════════════════════════════════',
+      'WORKED EXAMPLE (full Schwab screenshot with 14 positions)',
+      '═══════════════════════════════════════════════════════',
+      'If you saw a Schwab All-Positions page with these 14 rows: CMG, NIO, APRE, DIS, MSFT, CCL, AMD, AAPL, NVDA, LKNCY, NFLX, AMZN, GOOGL, 650194103 (NewAge bankrupt)',
+      'Your response would be (and this is literally what you should output, not a description of it):',
+      '',
+      'COUNT:13',
+      'CMG,36,56.78,1289.88',
+      'NIO,23,37.05,157.09',
+      'APRE,1,166.46,1.00',
+      'DIS,13.3114,115.46,1414.87',
+      'MSFT,7,394.68,2959.53',
+      'CCL,59.3085,21.97,1732.99',
+      'AMD,7,135.66,1948.73',
       'AAPL,26.3771,180.60,7127.88',
       'NVDA,48,126.74,9680.64',
+      'LKNCY,269,17.20,9089.51',
+      'NFLX,190,43.04,18488.90',
+      'AMZN,114,130.96,28563.84',
+      'GOOGL,115.9288,114.55,39610.55',
       '',
-      'Example (Robinhood mobile — NVDA 1.11 shares at $200.98):',
-      'NVDA,1.11,0,223.09',
+      'Note: NewAge XXXBANKR is omitted because Price/Market Value/Gain-Loss all show N/A (truly delisted).',
       '',
-      'RECURRING:',
-      'SCHD,15',
-      'VOO,40',
+      'Now do the same for the screenshots you are seeing. Start with COUNT:N, then output exactly N data rows.',
     ].join('\n');
 
     // Anthropic multimodal content array: image blocks then text instruction
@@ -278,24 +321,32 @@ aiRouter.post('/extract-holdings', async (req, res, next) => {
       { type: 'text', text: extractPrompt },
     ];
 
-    // 90-second timeout for multimodal extraction (longer than default 60s)
-    const text = await callAnthropic({ content, maxTokens: 1500, timeoutMs: 90_000 });
+    // 90-second timeout, bumped to 3000 tokens to accommodate larger position lists
+    const text = await callAnthropic({ content, maxTokens: 3000, timeoutMs: 90_000 });
+
+    // Parse the COUNT:N line if present for diagnostic info
+    const countMatch = text.match(/^\s*COUNT\s*:\s*(\d+)/im);
+    const declaredCount = countMatch ? parseInt(countMatch[1], 10) : null;
 
     // Validate response: should contain at least one comma-separated line that looks like holdings
     const lines = text.trim().split('\n').filter(l => l.trim());
-    const hasValidHoldings = lines.some(l => {
+    const dataLines = lines.filter(l => {
       const trimmed = l.trim();
-      // Skip headers and recurring marker
-      if (/^symbol|^recurring/i.test(trimmed)) return false;
-      // Valid holdings line has at least one comma
-      return trimmed.includes(',');
+      if (/^symbol|^recurring|^count\s*:|^count\s*$|^─|^═|^note\s*:|^now\s/i.test(trimmed)) return false;
+      if (!trimmed.includes(',')) return false;
+      // Must start with a ticker-looking first token
+      return /^[A-Z][A-Z0-9.\-]{0,7}\s*,/i.test(trimmed);
     });
+    const hasValidHoldings = dataLines.length > 0;
+
+    // If AI said COUNT:14 but only output 6 rows, warn (but still return the rows we got)
+    const undercount = declaredCount && dataLines.length < declaredCount * 0.7;
 
     if (!hasValidHoldings) {
-      return res.json({ text, warning: 'no_holdings_found' });
+      return res.json({ text, warning: 'no_holdings_found', declaredCount });
     }
 
-    res.json({ text });
+    res.json({ text, declaredCount, extractedRows: dataLines.length, undercount });
   } catch (e) { next(e); }
 });
 
