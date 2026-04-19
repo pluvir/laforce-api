@@ -210,30 +210,45 @@ aiRouter.post('/extract-holdings', async (req, res, next) => {
     if (images.length > 10) {
       return res.status(400).json({ error: 'max 10 images per request' });
     }
-    // Validate every image block
+
+    // Calculate total payload size and validate each image
+    let totalPayloadSize = 0;
     for (const img of images) {
       if (!img || !img.data || !img.mediaType) {
         return res.status(400).json({ error: 'each image must have { mediaType, data }' });
       }
+      // Strict mediaType validation: only png, jpeg, jpg, webp, gif
       if (!/^image\/(png|jpeg|jpg|webp|gif)$/.test(img.mediaType)) {
-        return res.status(400).json({ error: 'supported image types: png, jpeg, webp, gif' });
+        return res.status(400).json({ error: `invalid mediaType: ${img.mediaType}. Allowed: png, jpeg, jpg, webp, gif` });
       }
-      // Reject absurdly huge payloads (per image)
-      if (img.data.length > 8_000_000) {
-        return res.status(413).json({ error: 'image too large (max ~6MB base64 per image)' });
-      }
+      totalPayloadSize += img.data.length;
+    }
+
+    // Cap total payload size at 30MB
+    const maxTotalPayload = 30_000_000;
+    if (totalPayloadSize > maxTotalPayload) {
+      return res.status(413).json({ error: `total payload exceeds limit (${(totalPayloadSize / 1000000).toFixed(1)}MB). Max 30MB across all images.` });
     }
 
     const extractPrompt = [
-      `You are analyzing ${images.length} brokerage screenshot(s). Extract ALL stock/ETF holdings from ALL images combined.`,
+      `You are analyzing ${images.length} brokerage screenshot(s). Extract ALL stock/ETF holdings, but return ONE row per ticker — never duplicate.`,
+      '',
+      'CRITICAL DEDUP RULES — read these first:',
+      '- These screenshots are almost always ONE account shown in different views (positions list + overview chart + movers). Treat same ticker across images as the SAME position, not separate holdings.',
+      '- If ticker X appears in 3 images, return ONE row using the most authoritative source (the full positions list, not a "top movers" carousel).',
+      '- Skip screenshots that show only a total balance + line chart with no individual positions — they contain no holdings.',
+      '- If you genuinely see TWO different accounts (e.g. Investing + Roth IRA tabs both visible with different holdings), still return ONE row per ticker and SUM shares only across those distinct accounts.',
+      '',
+      'BROKER FORMAT NOTES:',
+      '- ROBINHOOD MOBILE: shows SYMBOL, "X.XXXXX shares", and a green-box price. THE GREEN-BOX NUMBER IS THE CURRENT SHARE PRICE, not market value. Calculate MARKET_VALUE = shares × price. Cost basis is usually not shown on this screen; put 0 if unknown.',
+      '- SCHWAB/FIDELITY DESKTOP: shows separate columns for Quantity, Price, Market Value, Cost Basis. Use the MARKET VALUE column (not Price) and the COST BASIS column directly.',
+      '- For COST_PER_SHARE: if only total cost basis is visible, divide by shares. If nothing visible, put 0.',
       '',
       'Rules:',
-      '- Include fractional shares (e.g. 26.3771 shares)',
-      '- Skip bankrupt/delisted positions with N/A price (no market value)',
-      '- Skip positions with $0.0001 or near-zero price (likely worthless)',
-      '- If a position appears in multiple screenshots, combine the shares (they may be different accounts)',
-      '- If you see "Recurring Investments" (e.g. SCHD $15/month, VOO $40/month), note them separately at the END after a line that says RECURRING:',
-      '- Extract market value and cost basis when visible',
+      '- Include fractional shares (e.g. 26.3771 shares, 0.236650 shares)',
+      '- Skip bankrupt/delisted positions with N/A price or $0.00 market value',
+      '- Skip positions with $0.0001 or near-zero price',
+      '- If you see "Recurring Investments" (e.g. SCHD $15/week, VOO $40/week), note them separately at the END after a line that says RECURRING:',
       '',
       'Return ONLY this format (no headers, no explanations):',
       'SYMBOL,SHARES,COST_PER_SHARE,MARKET_VALUE',
@@ -242,9 +257,13 @@ aiRouter.post('/extract-holdings', async (req, res, next) => {
       'RECURRING:',
       'SYMBOL,MONTHLY_AMOUNT',
       '',
-      'Example:',
+      'Example (Schwab):',
       'AAPL,26.3771,180.60,7127.88',
       'NVDA,48,126.74,9680.64',
+      '',
+      'Example (Robinhood mobile — NVDA 1.11 shares at $200.98):',
+      'NVDA,1.11,0,223.09',
+      '',
       'RECURRING:',
       'SCHD,15',
       'VOO,40',
@@ -259,7 +278,23 @@ aiRouter.post('/extract-holdings', async (req, res, next) => {
       { type: 'text', text: extractPrompt },
     ];
 
-    const text = await callAnthropic({ content, maxTokens: 1500 });
+    // 90-second timeout for multimodal extraction (longer than default 60s)
+    const text = await callAnthropic({ content, maxTokens: 1500, timeoutMs: 90_000 });
+
+    // Validate response: should contain at least one comma-separated line that looks like holdings
+    const lines = text.trim().split('\n').filter(l => l.trim());
+    const hasValidHoldings = lines.some(l => {
+      const trimmed = l.trim();
+      // Skip headers and recurring marker
+      if (/^symbol|^recurring/i.test(trimmed)) return false;
+      // Valid holdings line has at least one comma
+      return trimmed.includes(',');
+    });
+
+    if (!hasValidHoldings) {
+      return res.json({ text, warning: 'no_holdings_found' });
+    }
+
     res.json({ text });
   } catch (e) { next(e); }
 });
